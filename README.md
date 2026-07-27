@@ -52,24 +52,13 @@ Each entry follows: **what happened → why it happened → how I fixed it.**
 
 ---
 
-## 3. Not all RPC endpoints behave the same — even for the same chain
-
-**What happened:** Two separate problems, both related to talking to the Arc Testnet over its RPC (the API used to read/write blockchain data):
-
-**3a. Reading old events failed with a range error**
-
-Trying to scan for a contract's past events (e.g. "who's on the whitelist") by asking for *all* logs from the beginning failed with: `eth_getLogs is limited to a 10,000 range`. The public Arc Testnet RPC enforces a hard limit on how many blocks you can search in a single request. As the chain grows, asking for "everything since the start" becomes guaranteed to fail.
-
-*Fix:* Break the search into chunks (e.g. 9,000 blocks at a time, safely under the limit) and loop through them. Store how far you've already scanned, so next time you only need to scan the new blocks, not repeat the whole history.
-
-**3b. The exact same request worked from my terminal but failed from my deployed app**
-
-Using Foundry's `cast call` from my own computer, a contract read worked fine. But the *same* call, made from my app's server code (running on Vercel), failed with vague errors like `missing revert data`.
-
-*Fix:* Switching to a different RPC provider (`https://arc-testnet.drpc.org` instead of the original one) resolved it immediately. I never got a fully confirmed root cause, but the practical lesson stood regardless.
-
-**The lesson:** "It works in my terminal" and "it works from my deployed app" are two separate claims — test both, especially against a testnet, where RPC providers can be less consistent than mainnet. And when scanning blockchain history, always assume there's a range limit somewhere, even if the docs don't make it obvious upfront.
-
+## 3. 3. Not all RPC endpoints behave the same — even for the same chain
+What happened: The exact same contract read worked fine using Foundry's cast call from my own computer, but the same call, made from my app's server code (a Next.js API route running as a Vercel serverless function), failed with vague errors like missing revert data and CALL_EXCEPTION — using the same RPC endpoint (https://rpc.testnet.arc.network).
+Why it happened: I couldn't confirm the exact root cause, but it's most likely that requests from Vercel's serverless IP addresses were being handled unreliably by that particular RPC provider.
+The fix: Switching to a different RPC provider (https://arc-testnet.drpc.org) resolved it immediately, with no other code changes.
+Problematic RPC: https://rpc.testnet.arc.network
+Working RPC: https://arc-testnet.drpc.org
+The lesson: "It works with Foundry's cast" and "it works from my app's server environment" are two separate claims — test both independently, especially on a testnet, where RPC providers can behave inconsistently depending on where the request comes from.
 ---
 
 ## 4. Decimal numbers and blockchain integers don't mix

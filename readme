@@ -1,1 +1,113 @@
+# Lessons Learned: Building SnapRoll on Circle Wallets + Arc
 
+While building **SnapRoll** (automated cross-border payroll on Circle User-Controlled Wallets + Arc), I ran into several bugs that I couldn't find documented anywhere else. Sharing them here in plain language, in case they save another Arc/Circle builder some debugging time.
+
+Each entry follows: **what happened → why it happened → how I fixed it.**
+
+---
+
+## 1. Google login only works on your home page — until you fix this
+
+**What happened:** Sign-in with Google worked perfectly on my app's main page. But the moment I tried adding Google login to a *different* page (like `/approve`), something strange happened: after signing in, the browser always landed back on the **home page** — never the page the user actually started from. The login itself succeeded; it just "teleported" the user to the wrong place, with no login data available on the page they meant to use.
+
+**Why it happened:** This is a Circle Wallets + Google OAuth quirk, not a bug in my own code. Google Cloud Console only lets you register a **domain** as an authorized redirect destination (e.g. `https://yourapp.com`) — it does not let you register a specific *path* like `https://yourapp.com/approve`. Circle's SDK also only accepts a domain-level `redirectUri`. So no matter which page a user starts login from, Google *always* sends them back to the bare domain (the home page) when it's done. There is no config setting that fixes this — it's how the redirect mechanism is designed to work.
+
+**The fix:** Hand off the login result manually between pages, using the browser's local storage as a relay:
+
+1. **Before redirecting to Google**, save the page the user was actually on:
+   ```ts
+   localStorage.setItem("postLoginRedirect", window.location.pathname);
+   ```
+2. **On the home page**, once login succeeds, check if that value exists. If it does, don't treat the login as "for this page" — instead, stash the result and forward the browser to the original page:
+   ```ts
+   const redirectTo = localStorage.getItem("postLoginRedirect");
+   if (redirectTo && redirectTo !== "/") {
+     localStorage.setItem("pendingLoginResult", JSON.stringify(result));
+     localStorage.removeItem("postLoginRedirect");
+     window.location.href = redirectTo;
+   }
+   ```
+3. **On the destination page**, when it first loads, check for that pending result *before* waiting on anything else, and use it directly:
+   ```ts
+   const pending = localStorage.getItem("pendingLoginResult");
+   if (pending) {
+     localStorage.removeItem("pendingLoginResult");
+     // use this result to finish logging in on this page
+   }
+   ```
+
+**The lesson:** If you're building a multi-page app with Circle Wallets + social login, do **not** assume login "just works" the same way on every page the way it does on the homepage. You need to build your own relay for the login result. I couldn't find this documented anywhere when I hit it — hopefully this saves someone else the same afternoon of confusion.
+
+---
+
+## 2. A working login can suddenly start failing for no visible reason
+
+**What happened:** Related to the issue above — after the login flow had been working for days, it suddenly started failing with an `Invalid credentials` error (Circle error code `155140`), with no code changes on my end.
+
+**Why it happened:** Circle Wallets' login flow relies on a `deviceId` value that gets cached in the browser's local storage the first time you use the SDK there. If that cached value ever falls out of sync with what Circle's backend expects (this can happen after config changes on Circle's side, long periods of inactivity, or just browser data getting into a weird state), every future login attempt fails — even though nothing about your actual code is wrong.
+
+**The fix:** Clear the site's stored data (cookies + local storage) for the app and log in again — this forces a fresh `deviceId` to be issued. As a more permanent safeguard, I added a check: if a login attempt returns error code `155140`, the app automatically clears the relevant cached keys itself and prompts the user to just try logging in again, instead of leaving them stuck looking at a cryptic error.
+
+**The lesson:** Not every authentication bug is a logic bug. Some are just stale local cache fighting with a remote system. If a previously-working login suddenly breaks with no code changes, check the browser's stored data before you go hunting through your own code.
+
+---
+
+## 3. Not all RPC endpoints behave the same — even for the same chain
+
+**What happened:** Two separate problems, both related to talking to the Arc Testnet over its RPC (the API used to read/write blockchain data):
+
+**3a. Reading old events failed with a range error**
+
+Trying to scan for a contract's past events (e.g. "who's on the whitelist") by asking for *all* logs from the beginning failed with: `eth_getLogs is limited to a 10,000 range`. The public Arc Testnet RPC enforces a hard limit on how many blocks you can search in a single request. As the chain grows, asking for "everything since the start" becomes guaranteed to fail.
+
+*Fix:* Break the search into chunks (e.g. 9,000 blocks at a time, safely under the limit) and loop through them. Store how far you've already scanned, so next time you only need to scan the new blocks, not repeat the whole history.
+
+**3b. The exact same request worked from my terminal but failed from my deployed app**
+
+Using Foundry's `cast call` from my own computer, a contract read worked fine. But the *same* call, made from my app's server code (running on Vercel), failed with vague errors like `missing revert data`.
+
+*Fix:* Switching to a different RPC provider (`https://arc-testnet.drpc.org` instead of the original one) resolved it immediately. I never got a fully confirmed root cause, but the practical lesson stood regardless.
+
+**The lesson:** "It works in my terminal" and "it works from my deployed app" are two separate claims — test both, especially against a testnet, where RPC providers can be less consistent than mainnet. And when scanning blockchain history, always assume there's a range limit somewhere, even if the docs don't make it obvious upfront.
+
+---
+
+## 4. Decimal numbers and blockchain integers don't mix
+
+**What happened:** Approving a payment would sometimes appear to just... freeze. No error, no crash — the button just stopped doing anything.
+
+**Why it happened:** Blockchains don't store token amounts as decimals like `0.1`. USDC, for example, stores amounts as whole integers using 6 decimal places internally, so "0.1 USDC" is actually stored as the integer `100000`. Somewhere in my code, a raw decimal string like `"0.1"` was being handed directly to a function that expects a big whole-number integer type (`BigInt`). Converting a decimal string like that into a `BigInt` throws an error — and because I hadn't wrapped that step in error handling, the error was thrown and silently swallowed, so nothing appeared on screen at all.
+
+**The fix:**
+- Convert user-entered decimal amounts into the correct integer format the moment they're captured, and only convert back to decimals when displaying them to a user.
+- Wrap the conversion in a try/catch, and make sure the catch block actually surfaces something to the user ("Something went wrong") instead of failing invisibly.
+
+**The lesson:** A UI that silently "freezes" almost always has an error happening somewhere that just isn't being shown. Any place your code does `BigInt(someValue)` is worth double-checking — decimal strings are a common, easy-to-miss cause of silent failures.
+
+---
+
+## 5. Duplicate rows can silently pile up from "harmless" repeated actions
+
+**What happened:** After a payment got approved, the assigned approver received the same Telegram notification **four times** in a row.
+
+**Why it happened:** The function that registers a Telegram account as an approver simply inserted a new database row every time it ran, with no check for "does this exact registration already exist?" During development, re-testing the connect flow, or re-deploying a contract, quietly created duplicate rows each time. None of it caused a visible error — the app worked fine — so it went unnoticed until the *volume of notifications* made the duplication obvious.
+
+**The fix:**
+```ts
+// Check for an existing match before creating a new row
+const existing = await db
+  .select()
+  .where({ wallet, scheduler })
+  .maybeSingle();
+
+if (existing) return existing; // don't insert a duplicate
+// otherwise, proceed to insert as normal
+```
+
+**The lesson:** "No error was thrown" is not the same as "this is working correctly." Silent duplication is easy to miss because nothing looks broken until a side effect — in my case, spammy repeated notifications — makes it visible. Anywhere a user action could plausibly run more than once (double clicks, repeated testing, re-deploys), ask: what happens to the database if this runs twice?
+
+---
+
+## Closing thought
+
+The most valuable bugs to document aren't always the hardest ones technically — they're the ones where you search for the exact error message and find *nothing*. That was true for both the Circle Wallets redirect behavior and the `deviceId` cache issue above; at the time, I couldn't find another builder describing either one. If you're building on Circle Wallets + Arc and hit something equally undocumented, consider writing it up too — the next builder searching for that error message will thank you.
